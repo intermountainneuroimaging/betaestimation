@@ -1,0 +1,116 @@
+"""
+One activity pattern per condition or per trial, for one run.
+
+events: a DataFrame with
+  onset, duration   seconds
+  trial_type        the event's own name (used for nuisance regressors)
+  label             the condition of interest, or NaN for events that are not of interest
+                    (they are modeled as nuisance when model_unlabeled_events)
+  event_id          unique per event (e.g. trial_index); needed for unit="trial"
+
+method "glm":
+  unit "condition"  one regressor per label (all its events), unit contrast -> t / z / beta map
+  unit "trial"      glm.trial_model "lsa": every labeled event its own regressor in one GLM;
+                    "lss": one GLM per labeled event (glm.lss_other: other events by trial_type,
+                    or all in one regressor). The run is masked / smoothed / scaled once.
+method "volume_average":
+  the run is cleaned (confounds, detrend, band-pass, z-score), then each labeled event's volumes
+  (onset + hemodynamic_lag over its duration; censored volumes skipped) are averaged; unit
+  "condition" then averages the events of each label.
+
+Yields PatternEstimate(label, event_id or None, n_events, image).
+"""
+
+from dataclasses import dataclass
+
+import numpy as np
+import pandas as pd
+
+from betaestimation.glm import contrast_map, contrast_values, fit_first_level, frame_times, lss, safe_name
+from betaestimation.timeseries import clean_run, event_volumes, glm_ready, load_masked
+
+METHODS = {"glm", "volume_average"}
+UNITS = {"condition", "trial"}
+VOLUME_AVERAGE_DEFAULTS = {"hemodynamic_lag": 4.0, "detrend": True, "standardize": "zscore_sample",
+                           "high_pass": None, "low_pass": None, "smoothing_fwhm": None}
+
+
+@dataclass
+class PatternEstimate:
+    label: object
+    event_id: object
+    n_events: int
+    img: object
+
+
+def _regressor(row, unit: str) -> str:
+    if pd.isna(row["label"]):
+        return f"nuisance_{safe_name(row['trial_type'])}"
+    if unit == "trial":
+        return f"lbl_{safe_name(row['label'])}_ev{safe_name(row['event_id'])}"
+    return f"lbl_{safe_name(row['label'])}"
+
+
+def estimate_run_patterns(boldfile, events: pd.DataFrame, tr: float, n_frames: int, mask_img, nuisance=None,
+                          method: str = "glm", unit: str = "condition", glm: dict = None,
+                          volume_average: dict = None, model_unlabeled_events: bool = True):
+    if method not in METHODS or unit not in UNITS:
+        raise ValueError(f"method must be one of {sorted(METHODS)} and unit one of {sorted(UNITS)}")
+    events = events.reset_index(drop=True)
+    if method == "volume_average":
+        yield from _volume_average(boldfile, events, tr, n_frames, mask_img, nuisance, unit,
+                                   {**VOLUME_AVERAGE_DEFAULTS, **(volume_average or {})})
+        return
+    glm = dict(glm or {})
+    output_type = glm.get("output_type", "t")
+    model_df = events if model_unlabeled_events else events.dropna(subset=["label"]).reset_index(drop=True)
+    if unit == "trial" and glm.get("trial_model", "lss") == "lss":
+        yield from _lss(boldfile, model_df, tr, n_frames, mask_img, nuisance, glm, output_type)
+        return
+
+    design_events = model_df.assign(trial_type=[_regressor(r, unit) for _, r in model_df.iterrows()])
+    model = fit_first_level(boldfile, design_events, tr, mask_img, nuisance, glm)
+    labeled = model_df.dropna(subset=["label"])
+    groups = labeled.groupby("event_id", sort=False) if unit == "trial" else labeled.groupby("label", sort=False)
+    for _, grp in groups:
+        first = grp.iloc[0]
+        img = contrast_map(model, _regressor(first, unit), output_type)
+        yield PatternEstimate(first["label"], first["event_id"] if unit == "trial" else None, len(grp), img)
+
+
+def _lss(boldfile, model_df, tr, n_frames, mask_img, nuisance, glm, output_type):
+    masker, raw = load_masked(boldfile, mask_img, tr, glm.get("smoothing_fwhm"))
+    keep = np.arange(n_frames) if nuisance is None else nuisance.kept(n_frames)
+    data = glm_ready(raw, nuisance, glm.get("signal_scaling", 0))
+    times = frame_times(raw.shape[0], tr, glm.get("slice_time_ref", 0.0))
+    events = model_df.assign(trial_type=[_regressor(r, "condition") for _, r in model_df.iterrows()])
+    targets = list(np.flatnonzero(model_df["label"].notna().values))
+    confounds = None if nuisance is None else nuisance.confounds
+    for k, con in lss(data, keep, times, events, targets, confounds, glm, glm.get("lss_other", "condition")):
+        row = model_df.iloc[k]
+        yield PatternEstimate(row["label"], row["event_id"], 1, masker.inverse_transform(contrast_values(con, output_type)))
+
+
+def _volume_average(boldfile, events, tr, n_frames, mask_img, nuisance, unit, va):
+    masker, raw = load_masked(boldfile, mask_img, tr, va.get("smoothing_fwhm"))
+    data = clean_run(raw, tr, nuisance, detrend=va["detrend"], standardize=va["standardize"],
+                     high_pass=va["high_pass"], low_pass=va.get("low_pass"))
+    per_event = []
+    for _, ev in events.dropna(subset=["label"]).iterrows():
+        vols = event_volumes(float(ev["onset"]), float(ev["duration"]), tr, n_frames, va["hemodynamic_lag"])
+        if len(vols) == 0:
+            print(f"  (!) event {ev['trial_type']} at {ev['onset']}s falls past the end of the run; skipped")
+            continue
+        window = data[vols]
+        if np.isnan(window[:, 0]).all():
+            print(f"  (!) every volume of event {ev['trial_type']} at {ev['onset']}s is censored; skipped")
+            continue
+        per_event.append((ev["label"], ev["event_id"], np.nanmean(window, axis=0)))
+
+    if unit == "trial":
+        for label, event_id, vec in per_event:
+            yield PatternEstimate(label, event_id, 1, masker.inverse_transform(vec))
+        return
+    for label in dict.fromkeys(lbl for lbl, _, _ in per_event):
+        vecs = [v for lbl, _, v in per_event if lbl == label]
+        yield PatternEstimate(label, None, len(vecs), masker.inverse_transform(np.mean(vecs, axis=0)))
