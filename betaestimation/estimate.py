@@ -51,12 +51,25 @@ def _regressor(row, unit: str) -> str:
     return f"lbl_{safe_name(row['label'])}"
 
 
+def check_label_names(labels):
+    """Regressors are named lbl_<safe_name(label)>, which keeps only letters and digits, so labels
+    that differ only in other characters (dog_1 / dog1) would be fit as ONE regressor."""
+    seen = {}
+    for label in labels:
+        seen.setdefault(safe_name(label), []).append(label)
+    clashes = {k: v for k, v in seen.items() if len(v) > 1}
+    if clashes:
+        detail = "; ".join(f"{v} -> {k!r}" for k, v in clashes.items())
+        raise ValueError(f"labels collide after removing non-alphanumeric characters: {detail}")
+
+
 def estimate_run_patterns(boldfile, events: pd.DataFrame, tr: float, n_frames: int, mask_img, nuisance=None,
                           method: str = "glm", unit: str = "condition", glm: dict = None,
                           volume_average: dict = None, model_unlabeled_events: bool = True):
     if method not in METHODS or unit not in UNITS:
         raise ValueError(f"method must be one of {sorted(METHODS)} and unit one of {sorted(UNITS)}")
     events = events.reset_index(drop=True)
+    check_label_names(events["label"].dropna().unique())
     if method == "volume_average":
         yield from _volume_average(boldfile, events, tr, n_frames, mask_img, nuisance, unit,
                                    {**VOLUME_AVERAGE_DEFAULTS, **(volume_average or {})})

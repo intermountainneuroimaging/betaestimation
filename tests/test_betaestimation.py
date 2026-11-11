@@ -177,3 +177,10 @@ def test_merge_blocks():
     ev = pd.DataFrame({"onset": [0, 3, 6, 20], "duration": 1.0, "trial_type": ["x", "x", "y", "x"]})
     merged = merge_blocks(ev, gap=2.5)
     assert merged.to_dict("list") == {"onset": [0, 6, 20], "duration": [4.0, 1.0, 1.0], "trial_type": ["x", "y", "x"]}
+
+
+def test_labels_that_collide_after_safe_name_are_rejected():
+    from betaestimation.estimate import check_label_names
+    check_label_names(["dog1", "dog2", "cat-1"])
+    with pytest.raises(ValueError, match="dog_1"):
+        check_label_names(["dog_1", "dog1", "cat"])
