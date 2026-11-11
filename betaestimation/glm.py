@@ -1,14 +1,17 @@
 """
 GLM building blocks (nilearn): single-run first-level fits, least-squares-separate (LSS)
-single-trial fits, a concatenated multi-run GLM with shared regressors, contrasts, and mini-block
+fits (one GLM per item, i.e. per event of interest), a concatenated multi-run GLM with shared regressors, contrasts, and mini-block
 merging of events.
 
 GLM parameters are one dict ("glm"): any nilearn FirstLevelModel keyword (hrf_model,
 drift_model, high_pass, drift_order, fir_delays, min_onset, noise_model, smoothing_fwhm,
 signal_scaling, slice_time_ref, minimize_memory, ...) plus these, which this package reads:
   output_type   "t" | "z" | "beta"         which map a contrast returns
-  trial_model   "lsa" | "lss"              single-trial estimation (see estimate.py)
-  lss_other     "condition" | "single"     how LSS models the other events
+  item_model    "lsa" | "lss"              one-pattern-per-item estimation (see estimate.py)
+  lss_other     "by_label" | "single"      how LSS models the other events
+
+Vocabulary: an event is one row of an events table; an item is one event of interest; a
+label groups items (an exemplar's repeats, or a condition) for pooled estimates.
 """
 
 import re
@@ -19,16 +22,34 @@ from nilearn.glm.contrasts import compute_contrast
 from nilearn.glm.first_level import FirstLevelModel, make_first_level_design_matrix, run_glm
 
 OUTPUT_TYPES = {"t": "stat", "z": "z_score", "beta": "effect_size"}
-TRIAL_MODELS = {"lsa", "lss"}
-LSS_OTHER = {"condition", "single"}
+ITEM_MODELS = {"lsa", "lss"}
+LSS_OTHER = {"by_label", "single"}
 # keys of the glm dict that are this package's, not FirstLevelModel keywords
-PACKAGE_KEYS = ("output_type", "trial_model", "lss_other", "confounds")
+PACKAGE_KEYS = ("output_type", "item_model", "lss_other", "confounds")
 # keys forwarded to make_first_level_design_matrix when building designs by hand
 DESIGN_KEYS = ("hrf_model", "drift_model", "high_pass", "drift_order", "fir_delays", "min_onset")
 
 
 def safe_name(name) -> str:
     return re.sub(r"[^A-Za-z0-9]+", "", str(name))
+
+
+RENAMED_GLM_KEYS = {"trial_model": "item_model"}
+RENAMED_LSS_OTHER = {"condition": "by_label"}
+
+
+def check_glm_options(glm: dict) -> list:
+    """Problems with this package's glm keys, including the renamed ones -> list of messages."""
+    glm = glm or {}
+    problems = [f"glm.{old} has been renamed glm.{new}" for old, new in RENAMED_GLM_KEYS.items() if old in glm]
+    other = glm.get("lss_other", "by_label")
+    if other in RENAMED_LSS_OTHER:
+        problems.append(f"glm.lss_other {other!r} has been renamed {RENAMED_LSS_OTHER[other]!r}")
+    elif other not in LSS_OTHER:
+        problems.append(f"glm.lss_other must be one of {sorted(LSS_OTHER)}")
+    if glm.get("item_model", "lss") not in ITEM_MODELS:
+        problems.append(f"glm.item_model must be one of {sorted(ITEM_MODELS)}")
+    return problems
 
 
 def first_level_kwargs(glm: dict) -> dict:
@@ -82,10 +103,11 @@ def contrast_values(contrast, output_type: str = "t") -> np.ndarray:
 
 
 def lss(data: np.ndarray, keep: np.ndarray, times: np.ndarray, events: pd.DataFrame, targets,
-        confounds: pd.DataFrame = None, glm: dict = None, lss_other: str = "condition"):
+        confounds: pd.DataFrame = None, glm: dict = None, lss_other: str = "by_label"):
     """Least-squares-separate (Mumford et al., 2012): one GLM per target event, with that event
-    as the only regressor of interest. The other events are modeled by their trial_type
-    ("condition", Mumford's LSS-N) or as one regressor ("single", Mumford's original LSS).
+    as the only regressor of interest. The other events are modeled by their trial_type column
+    ("by_label": one regressor per label / nuisance type, Mumford's LSS-N) or all together as one
+    regressor ("single", Mumford's original LSS).
 
     data    kept volumes x voxels, already masked / smoothed / scaled (see timeseries.glm_ready)
     keep    indices of the kept volumes; designs are built on the full timeline (`times`) and

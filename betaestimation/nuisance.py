@@ -6,10 +6,17 @@ confounds (a dict, or None for no confound regressors):
   {"source": "fmriprep", ...}            nilearn.interfaces.fmriprep.load_confounds on the run's
                                          fMRIPrep BOLD file; every other key is passed through
                                          (strategy, motion, wm_csf, global_signal, compcor,
-                                         n_compcor, scrub, fd_threshold, std_dvars_threshold,
+                                         n_compcor, fd_threshold, std_dvars_threshold,
                                          ica_aroma, tedana, demean). With "scrub" /
                                          "non_steady_state" in the strategy it also returns which
                                          volumes to keep.
+     min_segment_volumes                 (only with "scrub" in the strategy) after the FD / DVARS
+                                         outliers are flagged, runs of good volumes shorter than
+                                         this, stranded between outliers or at a run edge, are
+                                         flagged too. 0 = flag only the outliers. Omitted = nilearn's
+                                         default of 5 (Power et al. 2014). Passed to nilearn as its
+                                         `scrub` argument, renamed here because "scrub" is also the
+                                         strategy entry that switches outlier detection on.
   {"source": "file", "file_pattern",     explicit columns (and/or regex-matched columns) from any
    "columns": [...], "regex": [...]}     TSV; {subject} / {session} / {task} / {run} are filled from
                                          `entities`.
@@ -75,6 +82,20 @@ def load_file_confounds(spec: dict, entities: dict) -> pd.DataFrame:
     return conf[cols].fillna(0.0)
 
 
+MIN_SEGMENT_KEY = "min_segment_volumes"
+
+
+def fmriprep_kwargs(confounds: dict) -> dict:
+    """The confounds spec as nilearn load_confounds arguments: min_segment_volumes -> scrub."""
+    if "scrub" in confounds:
+        raise ValueError(f"confounds: the 'scrub' key is now {MIN_SEGMENT_KEY!r} (keep 'scrub' in the strategy list)")
+    kwargs = {k: (tuple(v) if k == "strategy" else v) for k, v in confounds.items()
+              if k not in ("source", MIN_SEGMENT_KEY)}
+    if MIN_SEGMENT_KEY in confounds:
+        kwargs["scrub"] = int(confounds[MIN_SEGMENT_KEY])
+    return kwargs
+
+
 def run_nuisance(boldfile: str, n_frames: int, confounds: dict = None, censoring: dict = None,
                  entities: dict = None) -> RunNuisance:
     """Confound regressors, kept volumes and QC for one run.
@@ -86,8 +107,7 @@ def run_nuisance(boldfile: str, n_frames: int, confounds: dict = None, censoring
     if confounds:
         if confounds.get("source", "fmriprep") == "fmriprep":
             from nilearn.interfaces.fmriprep import load_confounds
-            kwargs = {k: (tuple(v) if k == "strategy" else v) for k, v in confounds.items() if k != "source"}
-            conf, keep = load_confounds(boldfile, **kwargs)
+            conf, keep = load_confounds(boldfile, **fmriprep_kwargs(confounds))
         else:
             conf = load_file_confounds(confounds, entities)
 
@@ -140,6 +160,15 @@ def validate_nuisance(confounds: dict = None, censoring: dict = None, drift_mode
             if "compcor" in strategy and "high_pass" not in strategy:
                 errors.append("confounds.strategy: fMRIPrep's CompCor components assume the 'high_pass' "
                               "cosine regressors are also included (nilearn enforces this)")
+            if "scrub" in confounds:
+                errors.append(f"confounds.scrub has been renamed confounds.{MIN_SEGMENT_KEY} (the minimum run of "
+                              "good volumes kept between outliers); 'scrub' stays in the strategy list")
+            seg = confounds.get(MIN_SEGMENT_KEY)
+            if seg is not None:
+                if isinstance(seg, bool) or not isinstance(seg, int) or seg < 0:
+                    errors.append(f"confounds.{MIN_SEGMENT_KEY} must be an integer >= 0")
+                elif "scrub" not in strategy:
+                    warnings.append(f"confounds.{MIN_SEGMENT_KEY} has no effect without 'scrub' in confounds.strategy")
             if "global_signal" in strategy:
                 warnings.append("confounds.strategy includes 'global_signal'; GSR can induce negative correlations "
                                 "and shift pattern similarity -- make sure that is intended")

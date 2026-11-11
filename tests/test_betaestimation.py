@@ -12,7 +12,7 @@ from betaestimation.timeseries import (
     clean_run, compute_volume_range, event_volumes, glm_ready, load_masked, window_volumes)
 from tests.conftest import AFFINE, SHAPE, TR, events_table, make_run, patterns
 
-FMRIPREP = {"source": "fmriprep", "strategy": ["motion", "scrub"], "motion": "basic", "scrub": 0,
+FMRIPREP = {"source": "fmriprep", "strategy": ["motion", "scrub"], "motion": "basic", "min_segment_volumes": 0,
             "fd_threshold": 0.5, "std_dvars_threshold": 3.0}
 
 
@@ -51,6 +51,18 @@ def test_nuisance_censor_regress_and_drop(run_files):
     assert len([c for c in regress.confounds if c.startswith("spike_")]) == regress.qc["n_flagged"] >= 5
     drop_only = run_nuisance(run_files["bold"], 90, None, {"drop_initial_volumes": 4})
     assert drop_only.confounds is None and drop_only.sample_mask[0] == 4
+
+
+def test_min_segment_volumes_also_flags_short_good_segments(run_files):
+    exact = run_nuisance(run_files["bold"], 90, FMRIPREP)
+    padded = run_nuisance(run_files["bold"], 90, {**FMRIPREP, "min_segment_volumes": 50})
+    assert padded.qc["n_flagged"] > exact.qc["n_flagged"]   # outliers plus the short segments around them
+    assert set(padded.sample_mask) < set(exact.sample_mask)
+    with pytest.raises(ValueError, match="min_segment_volumes"):
+        run_nuisance(run_files["bold"], 90, {"source": "fmriprep", "strategy": ["motion", "scrub"], "scrub": 0})
+    assert any("renamed" in e for e in validate_nuisance({"strategy": ["scrub"], "scrub": 0})[0])
+    assert any("integer" in e for e in validate_nuisance({"strategy": ["scrub"], "min_segment_volumes": -1})[0])
+    assert any("no effect" in w for w in validate_nuisance({"strategy": ["motion"], "min_segment_volumes": 0})[1])
 
 
 def test_file_confounds_use_entities(run_files):
@@ -114,10 +126,10 @@ def recovered(estimates, pats, masker):
 
 
 @pytest.mark.parametrize("method,unit,glm", [
-    ("glm", "condition", {"output_type": "beta", "noise_model": "ols"}),
-    ("glm", "trial", {"output_type": "beta", "trial_model": "lsa", "noise_model": "ols"}),
-    ("glm", "trial", {"output_type": "beta", "trial_model": "lss", "noise_model": "ols"}),
-    ("volume_average", "condition", None),
+    ("glm", "pooled", {"output_type": "beta", "noise_model": "ols"}),
+    ("glm", "item", {"output_type": "beta", "item_model": "lsa", "noise_model": "ols"}),
+    ("glm", "item", {"output_type": "beta", "item_model": "lss", "noise_model": "ols"}),
+    ("volume_average", "pooled", None),
 ])
 def test_estimates_recover_condition_patterns(run_files, method, unit, glm):
     masker = NiftiMasker(mask_img=run_files["mask"]).fit()
@@ -125,9 +137,9 @@ def test_estimates_recover_condition_patterns(run_files, method, unit, glm):
     est = list(estimate_run_patterns(run_files["bold"], run_files["events"], TR, 90, run_files["mask"], nuis,
                                      method=method, unit=unit, glm=glm))
     n_labeled = run_files["events"]["label"].notna().sum()
-    assert len(est) == (3 if unit == "condition" else n_labeled)
+    assert len(est) == (3 if unit == "pooled" else n_labeled)
     assert all(e.label in "abc" for e in est)
-    if unit == "trial":
+    if unit == "item":
         assert sorted(e.event_id for e in est) == sorted(run_files["events"].dropna(subset=["label"])["event_id"])
     r = recovered(est, run_files["patterns"], masker)
     assert min(r.values()) > 0.8
@@ -144,9 +156,9 @@ def test_lss_equals_condition_glm_when_each_condition_occurs_once(tmp_path):
     nib.Nifti1Image(np.ones(SHAPE, np.uint8), AFFINE).to_filename(mask)
     glm = {"output_type": "t", "noise_model": "ols"}
     cond = {e.label: e.img for e in estimate_run_patterns(str(bold), ev, TR, 90, str(mask), method="glm",
-                                                          unit="condition", glm=glm)}
-    lss = {e.label: e.img for e in estimate_run_patterns(str(bold), ev, TR, 90, str(mask), method="glm", unit="trial",
-                                                         glm={**glm, "trial_model": "lss"})}
+                                                          unit="pooled", glm=glm)}
+    lss = {e.label: e.img for e in estimate_run_patterns(str(bold), ev, TR, 90, str(mask), method="glm", unit="item",
+                                                         glm={**glm, "item_model": "lss"})}
     for label in "abc":
         assert np.allclose(np.asarray(cond[label].dataobj), np.asarray(lss[label].dataobj), atol=1e-6)
 
@@ -184,3 +196,14 @@ def test_labels_that_collide_after_safe_name_are_rejected():
     check_label_names(["dog1", "dog2", "cat-1"])
     with pytest.raises(ValueError, match="dog_1"):
         check_label_names(["dog_1", "dog1", "cat"])
+
+
+def test_renamed_units_and_glm_keys_are_rejected(run_files):
+    from betaestimation.estimate import estimate_run_patterns
+    ev = pd.DataFrame({"onset": [10.0], "duration": [2.0], "trial_type": ["a"], "label": ["a"], "event_id": [0]})
+    with pytest.raises(ValueError, match="'pooled'"):
+        list(estimate_run_patterns(run_files["bold"], ev, 2.0, 90, None, unit="condition"))
+    with pytest.raises(ValueError, match="item_model"):
+        list(estimate_run_patterns(run_files["bold"], ev, 2.0, 90, None, unit="item", glm={"trial_model": "lss"}))
+    with pytest.raises(ValueError, match="by_label"):
+        list(estimate_run_patterns(run_files["bold"], ev, 2.0, 90, None, unit="item", glm={"lss_other": "condition"}))

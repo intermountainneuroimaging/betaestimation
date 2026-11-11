@@ -5,7 +5,7 @@ betaestimation -- shared fMRI beta / pattern estimation for the lab's MVPA (mvpa
   nuisance     fMRIPrep / TSV confounds, censoring (scrub, dummy scans, spike regressors), run QC
   timeseries   masking, cleaning with censored volumes kept as NaN rows, GLM scaling, event windows
   glm          first-level fits, LSS, concatenated multi-run GLMs, contrasts, mini-block merging
-  estimate     one pattern per condition or trial per run (GLM: condition / LSA / LSS; volume averaging)
+  estimate     one pattern per item or per label (items pooled) per run (GLM: pooled / LSA / LSS; volume averaging)
   masks        subject brain mask, label-image ROIs, cluster-extent filtering
 """
 
