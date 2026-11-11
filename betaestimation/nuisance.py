@@ -20,6 +20,10 @@ confounds (a dict, or None for no confound regressors):
   {"source": "file", "file_pattern",     explicit columns (and/or regex-matched columns) from any
    "columns": [...], "regex": [...]}     TSV; {subject} / {session} / {task} / {run} are filled from
                                          `entities`.
+     "outlier_regex": [...]              optional: 0/1 columns flagging bad volumes (e.g. fMRIPrep's
+                                         motion_outlier_NN). Volumes with a nonzero value are
+                                         censored like scrubbed volumes (sample mask, or spikes with
+                                         censoring.mode "regress"); these columns are not regressors.
 
 censoring (a dict, or None):
   drop_initial_volumes  N leading volumes to discard (dummy scans not already flagged by fMRIPrep)
@@ -67,18 +71,31 @@ def fmriprep_confounds_path(boldfile: str) -> str:
     return os.path.join(os.path.dirname(boldfile), f"{stem}_desc-confounds_timeseries.tsv")
 
 
-def load_file_confounds(spec: dict, entities: dict) -> pd.DataFrame:
+def _read_confounds_file(spec: dict, entities: dict):
     path = format_entities(spec["file_pattern"], entities)
     matches = glob.glob(path)
     if len(matches) != 1:
         raise FileNotFoundError(f"confounds: expected 1 file for {path!r}, found {len(matches)}")
-    conf = pd.read_csv(matches[0], sep="\t")
+    return matches[0], pd.read_csv(matches[0], sep="\t")
+
+
+def file_outliers(spec: dict, entities: dict) -> np.ndarray:
+    """Indices of the volumes flagged (nonzero) in any column matching spec["outlier_regex"]."""
+    _, conf = _read_confounds_file(spec, entities)
+    cols = [c for c in conf.columns if any(re.fullmatch(rx, c) for rx in spec.get("outlier_regex") or [])]
+    if not cols:
+        return np.array([], dtype=int)
+    return np.flatnonzero(conf[cols].fillna(0).to_numpy().any(axis=1))
+
+
+def load_file_confounds(spec: dict, entities: dict) -> pd.DataFrame:
+    path, conf = _read_confounds_file(spec, entities)
     cols = list(spec.get("columns") or [])
     for rx in spec.get("regex") or []:
         cols += [c for c in conf.columns if re.fullmatch(rx, c) and c not in cols]
     missing = [c for c in cols if c not in conf.columns]
     if missing:
-        raise KeyError(f"confounds: column(s) {missing} not in {matches[0]}")
+        raise KeyError(f"confounds: column(s) {missing} not in {path}")
     return conf[cols].fillna(0.0)
 
 
@@ -110,6 +127,10 @@ def run_nuisance(boldfile: str, n_frames: int, confounds: dict = None, censoring
             conf, keep = load_confounds(boldfile, **fmriprep_kwargs(confounds))
         else:
             conf = load_file_confounds(confounds, entities)
+            if confounds.get("outlier_regex"):
+                bad = file_outliers(confounds, entities)
+                if len(bad):
+                    keep = np.setdiff1d(np.arange(n_frames), bad)
 
     drop = int(censoring.get("drop_initial_volumes") or 0)
     if drop:
@@ -151,6 +172,9 @@ def validate_nuisance(confounds: dict = None, censoring: dict = None, drift_mode
             errors.append(f"confounds.source must be one of {sorted(CONFOUND_SOURCES)}")
         elif source == "file" and not confounds.get("file_pattern"):
             errors.append("confounds: source 'file' needs 'file_pattern'")
+        elif source == "file" and any(rx in (confounds.get("regex") or []) for rx in (confounds.get("outlier_regex") or [])):
+            errors.append("confounds: a pattern is in both 'regex' and 'outlier_regex'; outlier columns are "
+                          "censored, not regressed")
         elif source == "fmriprep":
             strategy = list(confounds.get("strategy", ("motion", "high_pass", "wm_csf")))
             if "high_pass" in strategy and drift_model:

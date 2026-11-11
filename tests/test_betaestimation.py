@@ -207,3 +207,20 @@ def test_renamed_units_and_glm_keys_are_rejected(run_files):
         list(estimate_run_patterns(run_files["bold"], ev, 2.0, 90, None, unit="item", glm={"trial_model": "lss"}))
     with pytest.raises(ValueError, match="by_label"):
         list(estimate_run_patterns(run_files["bold"], ev, 2.0, 90, None, unit="item", glm={"lss_other": "condition"}))
+
+
+def test_file_confounds_outlier_columns_censor_volumes(run_files, tmp_path):
+    src = fmriprep_confounds_path(run_files["bold"])
+    conf = pd.read_csv(src, sep="\t")
+    for v in (5, 40):
+        conf[f"motion_outlier_{v:02d}"] = (conf.index == v).astype(int)
+    path = tmp_path / "conf.tsv"
+    conf.to_csv(path, sep="\t", index=False)
+    spec = {"source": "file", "file_pattern": str(path), "columns": ["trans_x"], "outlier_regex": ["motion_outlier_.*"]}
+    censored = run_nuisance(run_files["bold"], 90, spec, {"drop_initial_volumes": 2})
+    assert list(censored.confounds.columns) == ["trans_x"]           # outlier columns are not regressors
+    assert {0, 1, 5, 40} == set(range(90)) - set(censored.sample_mask) and censored.qc["n_flagged"] == 4
+    regressed = run_nuisance(run_files["bold"], 90, spec, {"mode": "regress"})
+    assert regressed.sample_mask is None and [c for c in regressed.confounds if c.startswith("spike_")] == ["spike_0005", "spike_0040"]
+    assert any("both" in e for e in validate_nuisance({"source": "file", "file_pattern": "x", "regex": ["m.*"],
+                                                        "outlier_regex": ["m.*"]})[0])
