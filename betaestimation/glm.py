@@ -137,17 +137,25 @@ def fit_concatenated(runs: list, shared_prefix: str, glm: dict = None):
             "n_frames": int, "tr": float, "events": onset/duration/trial_type, "confounds": df|None}]
     -> (labels, results, design columns) for contrast()."""
     glm = glm or {}
+    design = concatenated_design(runs, shared_prefix, glm)
+    data = np.vstack([run["data"] for run in runs])
+    labels, results = run_glm(data, design.values, noise_model=glm.get("noise_model", "ar1"))
+    return labels, results, list(design.columns)
+
+
+def concatenated_design(runs: list, shared_prefix: str, glm: dict = None) -> pd.DataFrame:
+    """The stacked design matrix fit_concatenated fits (kept volumes of every run, in run order):
+    `shared_prefix` columns shared across runs, every other column renamed run<k>_<name>, zero
+    outside its run. `data` is not needed in `runs` here."""
+    glm = glm or {}
     kwargs = design_kwargs(glm)
-    designs, data = [], []
+    designs = []
     for k, run in enumerate(runs):
         times = frame_times(run["n_frames"], run["tr"], glm.get("slice_time_ref", 0.0))
         design = make_first_level_design_matrix(times, run["events"], add_regs=run.get("confounds"), **kwargs)
         design = design.rename(columns={c: f"run{k}_{c}" for c in design.columns if not str(c).startswith(shared_prefix)})
         designs.append(design.iloc[run["keep"]].reset_index(drop=True))
-        data.append(run["data"])
-    design = pd.concat(designs, ignore_index=True).fillna(0.0)
-    labels, results = run_glm(np.vstack(data), design.values, noise_model=glm.get("noise_model", "ar1"))
-    return labels, results, list(design.columns)
+    return pd.concat(designs, ignore_index=True).fillna(0.0)
 
 
 def contrast(labels, results, columns: list, weights: dict, stat: str = "t") -> np.ndarray:
